@@ -110,25 +110,46 @@ hdr "1. Заливаю конфиг клиента в контейнер"
 docker exec -i "$CT" sh -c 'cat > /tmp/xhttp-client.json' < /tmp/xhttp-client.json \
   && ok "конфиг записан" || { bad "не удалось записать конфиг"; exit 1; }
 
-hdr "2. Запускаю тестовый клиент Xray"
-docker exec "$CT" sh -c 'kill $(cat /tmp/xhttp-client.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/xhttp-client.pid' 2>/dev/null || true
-sleep 1
-docker exec -d "$CT" sh -c 'xray run -c /tmp/xhttp-client.json > /tmp/xhttp-client.log 2>&1 & echo $! > /tmp/xhttp-client.pid'
-sleep 4
+# убийство прошлых экземпляров без pgrep (его нет в контейнере ноды)
+KILLER='for p in /proc/[0-9]*; do
+  [ -r "$p/cmdline" ] || continue
+  if tr "\0" " " < "$p/cmdline" 2>/dev/null | grep -q xhttp-client.json; then
+    kill "${p#/proc/}" 2>/dev/null
+  fi
+done'
 
-# Надёжная проверка: ищем в логе факт запуска (pgrep в контейнере может отсутствовать)
-if docker exec "$CT" sh -c 'grep -qE "core: Xray .* started" /tmp/xhttp-client.log' 2>/dev/null; then
-  ok "клиент запущен (socks5 на 127.0.0.1:${SOCKS})"
-elif docker exec "$CT" sh -c 'grep -qi "listening TCP on 127.0.0.1:'"${SOCKS}"'" /tmp/xhttp-client.log' 2>/dev/null; then
-  ok "клиент слушает socks5 на 127.0.0.1:${SOCKS}"
+hdr "2. Запускаю тестовый клиент Xray"
+docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
+sleep 1
+
+# ВАЖНО: xray запускается через exec на переднем плане внутри docker exec -d.
+# Если увести его в фон через '&', шелл завершится и Docker убьёт процесс.
+docker exec -d "$CT" sh -c 'exec xray run -c /tmp/xhttp-client.json > /tmp/xhttp-client.log 2>&1'
+
+# ждём появления слушающего сокета (до 15 сек)
+UP=0
+for i in $(seq 1 15); do
+  if ss -tlnH "sport = :${SOCKS}" 2>/dev/null | grep -q .; then UP=1; break; fi
+  sleep 1
+done
+
+if [[ $UP -eq 1 ]]; then
+  ok "клиент запущен, socks5 слушает 127.0.0.1:${SOCKS}"
 else
-  bad "клиент не стартовал. Лог:"
+  bad "порт ${SOCKS} не слушается. Лог клиента:"
   docker exec "$CT" sh -c 'tail -25 /tmp/xhttp-client.log' 2>/dev/null | sed 's/^/       /'
+  docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
   exit 1
 fi
 
 hdr "3. Пробую выйти в интернет через сервер"
-RESULT=$(curl -sS --max-time 25 --socks5-hostname "127.0.0.1:${SOCKS}" https://api.ipify.org 2>&1 || echo "")
+echo "  запрос: curl --socks5-hostname 127.0.0.1:${SOCKS} https://api.ipify.org"
+CURLERR=$(mktemp)
+RESULT=$(curl -sS --max-time 25 --socks5-hostname "127.0.0.1:${SOCKS}" https://api.ipify.org 2>"$CURLERR")
+CRC=$?
+[[ -s "$CURLERR" ]] && echo -e "  ${Y}curl:${N} $(tr -d '\n' < "$CURLERR")"
+[[ $CRC -ne 0 ]] && echo -e "  ${Y}код возврата curl:${N} ${CRC}"
+rm -f "$CURLERR"
 
 if [[ "$RESULT" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   echo
@@ -150,17 +171,24 @@ if [[ "$RESULT" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
 else
   bad "туннель не поднялся"
   echo
-  echo -e "${Y}  Лог клиента (последние 30 строк):${N}"
-  docker exec "$CT" sh -c 'tail -30 /tmp/xhttp-client.log' 2>/dev/null | sed 's/^/    /'
+  echo -e "${Y}  Лог клиента (последние 40 строк):${N}"
+  docker exec "$CT" sh -c 'tail -40 /tmp/xhttp-client.log' 2>/dev/null | sed 's/^/    /'
   echo
-  echo -e "${Y}  Частые причины:${N}"
-  echo -e "    · UUID не принадлежит этому инбаунду / юзер отключён"
-  echo -e "    · path в клиенте не совпадает с path инбаунда"
-  echo -e "    · host в инбаунде Xray не равен ${DOMAIN}"
+  echo -e "${Y}  Как читать лог:${N}"
+  echo -e "    · есть строки про ${B}dial${N}/${B}connection${N}, но потом ошибка → клиент дошёл до сервера,"
+  echo -e "      причина в UUID (юзер не в этом инбаунде) или в path/host"
+  echo -e "    · ${B}нет ни одной строки${N} после \"started\" → запрос вообще не дошёл до outbound"
+  echo -e "    · ${B}context deadline exceeded${N} → сервер не отвечает на XHTTP по этому пути"
+  echo
+  echo -e "${Y}  Что проверить:${N}"
+  echo -e "    · UUID ${UUID:0:8}… действительно привязан к инбаунду VLESS_XHTTP_MEDIA"
+  echo -e "    · path инбаунда на ноде = ${XPATH}"
+  echo -e "    · host инбаунда на ноде = ${DOMAIN}"
 fi
 
 hdr "4. Убираю за собой"
-docker exec "$CT" sh -c 'kill $(cat /tmp/xhttp-client.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/xhttp-client.json /tmp/xhttp-client.pid /tmp/xhttp-client.log' 2>/dev/null || true
+docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
+docker exec "$CT" sh -c 'rm -f /tmp/xhttp-client.json /tmp/xhttp-client.log' 2>/dev/null || true
 rm -f /tmp/xhttp-client.json
 ok "тестовый клиент остановлен, временные файлы удалены"
 echo
