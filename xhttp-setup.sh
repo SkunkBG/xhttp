@@ -125,6 +125,25 @@ if [[ $PORTBUSY -eq 1 ]]; then
   [[ "${GO,,}" == y* ]] || die "Отменено"
 fi
 
+say "Проверяю сетевой режим ноды…"
+if command -v docker >/dev/null 2>&1; then
+  CID=$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -iE 'remnanode|remnawave|xray' | awk '{print $1}' | head -n1)
+  if [[ -n "$CID" ]]; then
+    NMODE=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CID" 2>/dev/null || echo "?")
+    CNAME=$(docker inspect -f '{{.Name}}' "$CID" 2>/dev/null | tr -d / || echo "?")
+    if [[ "$NMODE" == "host" ]]; then
+      say "Контейнер ${CNAME}: network_mode=host — Caddy достучится до Xray"
+    else
+      warn "Контейнер ${CNAME} работает в режиме network_mode=${NMODE}"
+      warn "127.0.0.1 внутри контейнера ≠ 127.0.0.1 на хосте."
+      warn "Caddy НЕ сможет проксировать в Xray. Нужен 'network_mode: host'"
+      warn "в docker-compose ноды Remnawave."
+      ask "Продолжить установку? [y/N]: " GO
+      [[ "${GO,,}" == y* ]] || die "Отменено"
+    fi
+  fi
+fi
+
 # ──────────────────────────────────────────────
 # 3. Установка Caddy
 # ──────────────────────────────────────────────
@@ -373,7 +392,10 @@ __GLOBAL__
 __DOMAIN__ {
 
 	# ── XHTTP инбаунд: замаскирован под эндпоинт стриминга сессии ──
-	handle __XPATH__/* {
+	# Матчер ловит и __XPATH__, и __XPATH__/, и __XPATH__/<uuid>:
+	# XHTTP в разных режимах обращается по всем трём вариантам.
+	@xhttp path __XPATH__ __XPATH__/*
+	handle @xhttp {
 		reverse_proxy 127.0.0.1:__XRAYPORT__ {
 			flush_interval -1
 			header_up X-Real-IP {remote_host}
@@ -531,6 +553,16 @@ else
   warn "Не удалось подтвердить HTTPS автоматически."
   warn "Проверьте: curl -v https://${DOMAIN}/v1/health"
   warn "Логи:      journalctl -u caddy --no-pager -n 40"
+fi
+
+# путь XHTTP не должен отдавать 404 (это значило бы, что он ушёл в заглушку)
+PCODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}${XPATH}/" 2>/dev/null || echo 000)
+if [[ "$PCODE" == "404" ]]; then
+  warn "Путь ${XPATH}/ отдаёт 404 — Caddy не проксирует его в Xray."
+elif [[ "$PCODE" == "502" || "$PCODE" == "000" ]]; then
+  info "Путь проксируется в Xray (${PCODE}). Инбаунд Xray ещё не поднят — это нормально до шага 1 ниже."
+else
+  say "Путь ${XPATH}/ проксируется (код ${PCODE})"
 fi
 
 # ──────────────────────────────────────────────

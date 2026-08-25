@@ -141,3 +141,22 @@ rm -rf /var/www/html /etc/caddy /root/xray-xhttp-config.json
 - [Project X — Конфигурация транспорта](https://xtls.github.io/ru/config/transports/)
 
 MIT
+
+## Диагностика
+
+Если сайт открывается, но VPN не подключается:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-diag.sh)
+```
+
+Скрипт проверит Caddy, порты, сетевой режим Docker-контейнера ноды, проксирование XHTTP-пути и доступность Xray напрямую.
+
+### Частые причины
+
+| Симптом | Причина |
+| --- | --- |
+| Путь отдаёт **404** | Caddy не проксирует путь в Xray — проверьте совпадение path |
+| Путь отдаёт **502** | Caddy проксирует, но Xray-инбаунд не поднят |
+| Никто не слушает **8001** | Конфиг Xray не применён на ноде |
+| Контейнер не в `network_mode: host` | `127.0.0.1` в контейнере ≠ `127.0.0.1` на хосте |
