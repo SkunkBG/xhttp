@@ -32,11 +32,31 @@ if [[ -z "$XPATH" ]]; then
 fi
 [[ -z "$XPATH" ]] && read -rp "Path (/v1/stream/...): " XPATH < /dev/tty
 
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
 UUID="${UUID:-}"
 if [[ -z "$UUID" ]]; then
-  echo -e "\n${Y}Нужен UUID любого активного пользователя из панели Remnawave.${N}"
-  echo -e "${Y}Панель → Users → любой юзер → поле UUID / Subscription UUID.${N}\n"
+  echo -e "\n${Y}Нужен VLESS-UUID пользователя (НЕ короткий ID подписки).${N}"
+  echo -e "${Y}Где взять: панель → любой юзер → ссылка подключения${N}"
+  echo -e "${Y}  vless://${G}6604f701-f025-4daf-a74e-f21a87670ea4${Y}@домен:443?...${N}"
+  echo -e "${Y}            ^^^^^^^^^ вот это, между vless:// и @${N}\n"
   read -rp "UUID пользователя: " UUID < /dev/tty
+fi
+
+# можно вставить всю ссылку целиком — вытащим UUID сами
+if [[ "$UUID" == vless://* ]]; then
+  UUID=$(echo "$UUID" | sed -E 's|^vless://([^@]+)@.*|\1|')
+  ok "UUID извлечён из ссылки"
+fi
+
+if ! [[ "$UUID" =~ $UUID_RE ]]; then
+  bad "Это не похоже на VLESS-UUID: ${UUID}"
+  echo -e "  ${Y}Ожидается формат 8-4-4-4-12, например:${N}"
+  echo -e "  ${Y}  6604f701-f025-4daf-a74e-f21a87670ea4${N}"
+  echo -e "  ${Y}Короткий ID подписки (вида -spDDGysn782uTuA) НЕ подойдёт —${N}"
+  echo -e "  ${Y}сервер такого пользователя не опознает.${N}\n"
+  read -rp "Всё равно продолжить? [y/N]: " GO < /dev/tty
+  [[ "${GO,,}" == y* ]] || exit 1
 fi
 
 echo -e "\n  Домен : ${DOMAIN}\n  Path  : ${XPATH}\n  UUID  : ${UUID:0:8}…\n"
@@ -91,16 +111,19 @@ docker exec -i "$CT" sh -c 'cat > /tmp/xhttp-client.json' < /tmp/xhttp-client.js
   && ok "конфиг записан" || { bad "не удалось записать конфиг"; exit 1; }
 
 hdr "2. Запускаю тестовый клиент Xray"
-docker exec "$CT" sh -c 'pkill -f xhttp-client.json' 2>/dev/null || true
+docker exec "$CT" sh -c 'kill $(cat /tmp/xhttp-client.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/xhttp-client.pid' 2>/dev/null || true
 sleep 1
-docker exec -d "$CT" sh -c 'xray run -c /tmp/xhttp-client.json > /tmp/xhttp-client.log 2>&1'
+docker exec -d "$CT" sh -c 'xray run -c /tmp/xhttp-client.json > /tmp/xhttp-client.log 2>&1 & echo $! > /tmp/xhttp-client.pid'
 sleep 4
 
-if docker exec "$CT" sh -c 'pgrep -f xhttp-client.json' >/dev/null 2>&1; then
+# Надёжная проверка: ищем в логе факт запуска (pgrep в контейнере может отсутствовать)
+if docker exec "$CT" sh -c 'grep -qE "core: Xray .* started" /tmp/xhttp-client.log' 2>/dev/null; then
   ok "клиент запущен (socks5 на 127.0.0.1:${SOCKS})"
+elif docker exec "$CT" sh -c 'grep -qi "listening TCP on 127.0.0.1:'"${SOCKS}"'" /tmp/xhttp-client.log' 2>/dev/null; then
+  ok "клиент слушает socks5 на 127.0.0.1:${SOCKS}"
 else
   bad "клиент не стартовал. Лог:"
-  docker exec "$CT" sh -c 'tail -20 /tmp/xhttp-client.log' 2>/dev/null | sed 's/^/       /'
+  docker exec "$CT" sh -c 'tail -25 /tmp/xhttp-client.log' 2>/dev/null | sed 's/^/       /'
   exit 1
 fi
 
@@ -137,7 +160,7 @@ else
 fi
 
 hdr "4. Убираю за собой"
-docker exec "$CT" sh -c 'pkill -f xhttp-client.json; rm -f /tmp/xhttp-client.json' 2>/dev/null || true
+docker exec "$CT" sh -c 'kill $(cat /tmp/xhttp-client.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/xhttp-client.json /tmp/xhttp-client.pid /tmp/xhttp-client.log' 2>/dev/null || true
 rm -f /tmp/xhttp-client.json
-ok "тестовый клиент остановлен"
+ok "тестовый клиент остановлен, временные файлы удалены"
 echo
