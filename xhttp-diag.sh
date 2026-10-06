@@ -10,6 +10,18 @@ ok(){   echo -e "  ${G}[OK]${N}   $*"; }
 bad(){  echo -e "  ${R}[FAIL]${N} $*"; }
 warn(){ echo -e "  ${Y}[??]${N}   $*"; }
 hdr(){  echo -e "\n${B}── $* ─────────────────────────────${N}"; }
+# curl сам печатает 000 при сбое соединения — дописывать код через `|| echo` нельзя
+http_code() {
+  local c
+  c=$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${2:-8}" "$1" 2>/dev/null) || true
+  echo "${c:-000}"
+}
+# ответ пришёл от API-заглушки Caddy, а не от Xray
+is_stub() {
+  local b
+  b=$(curl -sS --max-time "${2:-6}" "$1" 2>/dev/null | tr -d '\0' | head -c 2000) || true
+  [[ "$b" == *resource_not_found* ]]
+}
 
 [[ $EUID -eq 0 ]] || { echo "Запустите от root"; exit 1; }
 
@@ -39,6 +51,11 @@ ss -tlnpH 2>/dev/null | grep -E ':(80|443)\s' | sed 's/^/  /' | head -4
 if ss -tlnH "sport = :${XPORT}" 2>/dev/null | grep -q .; then
   OWN=$(ss -tlnpH "sport = :${XPORT}" 2>/dev/null | grep -oP 'users:\(\("\K[^"]+' | head -n1)
   ok "порт ${XPORT} слушается процессом: ${OWN:-?}"
+  LADDR=$(ss -tlnH "sport = :${XPORT}" 2>/dev/null | awk '{print $4}' | head -n1)
+  case "$LADDR" in
+    127.0.0.1:*|"[::1]":*) ok "слушает только localhost (${LADDR})" ;;
+    *) bad "слушает на ${LADDR} — инбаунд без TLS доступен снаружи, нужен listen 127.0.0.1" ;;
+  esac
 else
   bad "НИКТО не слушает 127.0.0.1:${XPORT} — Xray-инбаунд XHTTP не поднят!"
   echo -e "       ${Y}Это и есть причина. Конфиг Xray не применён на ноде.${N}"
@@ -68,8 +85,8 @@ fi
 # ─────────────────────────────────────────
 hdr "4. HTTPS и заглушка"
 for p in "/v1/health" "/v1/catalog" "/"; do
-  C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}${p}" 2>/dev/null || echo 000)
-  [[ "$C" == "200" ]] && ok "${p} → ${C}" || bad "${p} → ${C}"
+  C=$(http_code "https://${DOMAIN}${p}")
+  if [[ "$C" == "200" ]]; then ok "${p} → ${C}"; else bad "${p} → ${C}"; fi
 done
 PROTO=$(curl -sS -o /dev/null -w '%{http_version}' --max-time 8 "https://${DOMAIN}/" 2>/dev/null || echo "?")
 [[ "$PROTO" == "2" ]] && ok "HTTP/2 работает" || warn "HTTP-версия: ${PROTO}"
@@ -80,20 +97,24 @@ if [[ -z "$XPATH" ]]; then
   bad "путь не найден в Caddyfile — проверьте конфиг"
 else
   for u in "${XPATH}" "${XPATH}/" "${XPATH}/test123"; do
-    C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}${u}" 2>/dev/null || echo 000)
+    if is_stub "https://${DOMAIN}${u}"; then
+      bad "${u} → ответ API-заглушки (ушло НЕ в Xray)"
+      continue
+    fi
+    C=$(http_code "https://${DOMAIN}${u}" 6)
     case "$C" in
-      404) bad "${u} → 404  (ушло в API-заглушку, НЕ в Xray)" ;;
-      200|400|502|000) ok  "${u} → ${C}  (перехвачено Caddy → Xray)" ;;
-      *)   warn "${u} → ${C}" ;;
+      502|000) warn "${u} → ${C}  (Caddy проксирует, но Xray не отвечает)" ;;
+      *)       ok   "${u} → ${C}  (ответил Xray)" ;;
     esac
   done
-  echo -e "\n  ${B}Как читать:${N} 404 = Caddy не отдал путь в Xray (проблема матчера)."
-  echo -e "  502/000/400 = Caddy проксирует, но Xray не отвечает (инбаунд не поднят)."
+  echo -e "\n  ${B}Как читать:${N} заглушку узнаём по телу ответа, а не по коду —"
+  echo -e "  404 умеет отдавать и сам Xray (например, на путь без завершающего слэша)."
+  echo -e "  502/000 = Caddy проксирует, но инбаунд не поднят."
 fi
 
 # ─────────────────────────────────────────
 hdr "6. Прямой стук в Xray, минуя Caddy"
-C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${XPORT}${XPATH:-/}" 2>/dev/null || echo 000)
+C=$(http_code "http://127.0.0.1:${XPORT}${XPATH:-}/" 5)
 if [[ "$C" == "000" ]]; then
   bad "127.0.0.1:${XPORT} не отвечает — Xray-инбаунд не работает"
 else

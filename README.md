@@ -12,7 +12,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-setup
 
 Скрипт спросит домен, email для Let's Encrypt и токен пути (можно сгенерировать автоматически).
 
-Неинтерактивно:
+Неинтерактивно (если `DOMAIN` задан, email и токен не спрашиваются; токен генерируется, либо передайте `TOKEN=...`):
 
 ```bash
 DOMAIN=api.example.com EMAIL=me@mail.com bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-setup.sh)
@@ -21,7 +21,7 @@ DOMAIN=api.example.com EMAIL=me@mail.com bash <(curl -Ls https://raw.githubuserc
 ## Как это работает
 
 ```
-Клиент → 443 (Caddy, настоящий сертификат Let's Encrypt)
+Клиент → 443/TCP (Caddy, настоящий сертификат Let's Encrypt)
              ├── /v1/stream/<токен>/*  → 127.0.0.1:8001  (Xray XHTTP)
              ├── /v1/health            → JSON
              ├── /v1/catalog           → JSON
@@ -31,6 +31,8 @@ DOMAIN=api.example.com EMAIL=me@mail.com bash <(curl -Ls https://raw.githubuserc
 ```
 
 Xray слушает только на `127.0.0.1` — наружу торчит один Caddy.
+
+Caddy занимает только **443/TCP** (HTTP/1.1 и HTTP/2). HTTP/3 выключен, поэтому UDP 443 остаётся свободным — например, для Hysteria2 на той же ноде.
 
 ## Почему медиа-API
 
@@ -58,7 +60,7 @@ XHTTP генерирует специфичный трафик: длинные �
 1. Проверяет ОС, DNS, занятость портов 80/443
 2. Устанавливает Caddy (если не установлен)
 3. Разворачивает страницу документации в `/var/www/html`
-4. Пишет `/etc/caddy/Caddyfile` (бэкап старого создаётся)
+4. Пишет `/etc/caddy/Caddyfile` — **целиком заменяет существующий** (сначала проверяет новый через `caddy validate`, бэкап старого создаётся рядом)
 5. Выпускает сертификат Let's Encrypt
 6. Настраивает UFW: открывает 80/443, закрывает 8001
 7. Генерирует готовый конфиг Xray в `/root/xray-xhttp-config.json`
@@ -66,7 +68,18 @@ XHTTP генерирует специфичный трафик: длинные �
 
 ## После установки
 
-Вставьте `/root/xray-xhttp-config.json` в конфиг ноды и создайте хост в панели:
+Скрипту нода не нужна — его можно запускать на чистом сервере до установки Remnawave Node. В конце он печатает готовый Config Profile (он же в `/root/xray-xhttp-config.json`).
+
+**Чистая нода:**
+
+1. Панель → `Config Profiles` → `Create Config Profile` → вставьте напечатанный профиль.
+2. Панель → `Nodes` → `Management` → `+` → скопируйте `docker-compose.yml`, запустите на сервере (`network_mode: host` обязателен).
+3. В карточке ноды `Next` → выберите профиль, включите инбаунд `VLESS_XHTTP_MEDIA` → `Create`.
+4. Включите инбаунд в Internal Squad.
+
+**Нода уже работает с другим профилем:** добавьте в него только блок inbound `VLESS_XHTTP_MEDIA`. Не заменяйте профиль целиком — пропадут остальные инбаунды (REALITY, Hysteria2).
+
+Затем создайте хост в панели:
 
 | Поле | Значение |
 | --- | --- |
@@ -106,7 +119,8 @@ curl -I --http2 https://ДОМЕН/     # HTTP/2
 
 - Debian / Ubuntu, root
 - Домен с A-записью на сервер
-- Свободные порты 80 и 443
+- Свободные порты 80/TCP и 443/TCP (UDP 443 не нужен)
+- Caddy на сервере не обслуживает другие сайты — Caddyfile перезаписывается
 
 Если 443 занят Xray с REALITY — перенесите REALITY на другой порт либо ставьте XHTTP на отдельный сервер. Скрипт предупредит.
 
@@ -132,8 +146,10 @@ systemctl reload caddy
 ```bash
 systemctl stop caddy && systemctl disable caddy
 apt remove caddy -y
-rm -rf /var/www/html /etc/caddy /root/xray-xhttp-config.json
+rm -f /var/www/html/index.html /var/www/html/robots.txt /etc/caddy/Caddyfile /root/xray-xhttp-config.json
 ```
+
+Бэкапы прежних файлов лежат в `/etc/caddy/Caddyfile.bak.*` и `/var/backups/xhttp-stub/`.
 
 ## Источники
 
@@ -156,7 +172,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-diag.
 
 | Симптом | Причина |
 | --- | --- |
-| Путь отдаёт **404** | Caddy не проксирует путь в Xray — проверьте совпадение path |
+| Путь отдаёт **404 с JSON заглушки** | Caddy не проксирует путь в Xray — проверьте совпадение path |
+| Путь отдаёт **пустой 404** | Ответил сам Xray (например, на путь без завершающего `/`) — это норма |
 | Путь отдаёт **502** | Caddy проксирует, но Xray-инбаунд не поднят |
 | Никто не слушает **8001** | Конфиг Xray не применён на ноде |
 | Контейнер не в `network_mode: host` | `127.0.0.1` в контейнере ≠ `127.0.0.1` на хосте |
@@ -184,6 +201,6 @@ bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-clien
 bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-doctor.sh)
 ```
 
-Проверяет всю цепочку, чинит матчер Caddy автоматически и — главное — **разбирает реальную ссылку из подписки**, показывая что именно получают клиенты: порт, security, path, sni, host. Каждый неверный параметр подсвечивается.
+Проверяет всю цепочку, предлагает починить устаревший матчер Caddy (только после подтверждения) и — главное — **разбирает реальную ссылку из подписки**, показывая что именно получают клиенты: порт, security, path, sni, host. Каждый неверный параметр подсвечивается.
 
 Спросит домен и ссылку на подписку любого юзера. UUID для теста туннеля извлекает из подписки сам.

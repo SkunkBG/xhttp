@@ -6,7 +6,7 @@
 #  Запуск:
 #    bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/xhttp/main/xhttp-setup.sh)
 #
-#  Неинтерактивно:
+#  Неинтерактивно (если DOMAIN задан, email и токен не спрашиваются):
 #    DOMAIN=api.example.com EMAIL=me@mail.com bash <(curl -Ls ...)
 #
 set -euo pipefail
@@ -15,13 +15,32 @@ XRAY_PORT=8001
 WEBROOT=/var/www/html
 CADDYFILE=/etc/caddy/Caddyfile
 OUTCONF=/root/xray-xhttp-config.json
+BACKUPDIR=/var/backups/xhttp-stub
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;36m'; D='\033[2m'; N='\033[0m'
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;36m'; N='\033[0m'
 say()  { echo -e "${G}==>${N} $*"; }
 info() { echo -e "${B} i ${N} $*"; }
 warn() { echo -e "${Y} ! ${N} $*"; }
 die()  { echo -e "${R} x ${N} $*" >&2; exit 1; }
-ask()  { local p="$1" v="$2"; read -rp "$(echo -e "${B}?${N} $p")" "$v" < /dev/tty; }
+# без терминала (cloud-init, ssh без -t) вопрос считается отвеченным пустой строкой
+ask()  {
+  local p="$1" v="$2"
+  if ! (: < /dev/tty) 2>/dev/null; then printf -v "$v" ''; return 0; fi
+  # shellcheck disable=SC2229
+  read -rp "$(echo -e "${B}?${N} $p")" "$v" < /dev/tty
+}
+# curl сам печатает 000 при сбое соединения — дописывать код через `|| echo` нельзя
+http_code() {
+  local c
+  c=$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${2:-8}" "$1" 2>/dev/null) || true
+  echo "${c:-000}"
+}
+# ответ пришёл от API-заглушки Caddy, а не от Xray
+is_stub() {
+  local b
+  b=$(curl -sS --max-time "${2:-6}" "$1" 2>/dev/null | tr -d '\0' | head -c 2000) || true
+  [[ "$b" == *resource_not_found* ]]
+}
 
 banner() {
 cat <<'EOF'
@@ -52,13 +71,17 @@ DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 TOKEN="${TOKEN:-}"
 
+# DOMAIN из окружения = неинтерактивный запуск: email и токен не спрашиваем
+NONINT=0
+[[ -n "$DOMAIN" ]] && NONINT=1
+
 if [[ -z "$DOMAIN" ]]; then
   ask "Домен (A-запись должна вести на этот сервер): " DOMAIN
 fi
 DOMAIN="${DOMAIN,,}"; DOMAIN="${DOMAIN// /}"
 [[ "$DOMAIN" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] || die "Некорректный домен: $DOMAIN"
 
-if [[ -z "$EMAIL" ]]; then
+if [[ -z "$EMAIL" && $NONINT -eq 0 ]]; then
   ask "Email для Let's Encrypt (Enter — пропустить): " EMAIL
 fi
 EMAIL="${EMAIL// /}"
@@ -67,7 +90,7 @@ if [[ -n "$EMAIL" && ! "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[a-zA-Z]{2,}$
   EMAIL=""
 fi
 
-if [[ -z "$TOKEN" ]]; then
+if [[ -z "$TOKEN" && $NONINT -eq 0 ]]; then
   ask "Секретный токен пути (Enter — сгенерировать): " TOKEN
 fi
 TOKEN="${TOKEN// /}"
@@ -127,7 +150,7 @@ fi
 
 say "Проверяю сетевой режим ноды…"
 if command -v docker >/dev/null 2>&1; then
-  CID=$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -iE 'remnanode|remnawave|xray' | awk '{print $1}' | head -n1)
+  CID=$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -iE 'remnanode|remnawave|xray' | awk '{print $1}' | head -n1 || true)
   if [[ -n "$CID" ]]; then
     NMODE=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CID" 2>/dev/null || echo "?")
     CNAME=$(docker inspect -f '{{.Name}}' "$CID" 2>/dev/null | tr -d / || echo "?")
@@ -169,7 +192,12 @@ fi
 # ──────────────────────────────────────────────
 say "Разворачиваю страницу документации…"
 mkdir -p "$WEBROOT"
-[[ -f "$WEBROOT/index.html" ]] && cp "$WEBROOT/index.html" "$WEBROOT/index.html.bak.$(date +%s)"
+# бэкап кладём вне веб-корня, иначе он раздаётся наружу
+if [[ -f "$WEBROOT/index.html" ]]; then
+  mkdir -p "$BACKUPDIR"
+  cp "$WEBROOT/index.html" "$BACKUPDIR/index.html.$(date +%s)"
+  info "Бэкап старой страницы: ${BACKUPDIR}"
+fi
 
 cat > "$WEBROOT/index.html" <<'HTMLEOF'
 <!DOCTYPE html>
@@ -377,7 +405,7 @@ sed -i "s|__DOMAIN__|${DOMAIN}|g" "$WEBROOT/index.html"
 
 printf 'User-agent: *\nDisallow: /v1/\n' > "$WEBROOT/robots.txt"
 
-chown -R caddy:caddy "$WEBROOT" 2>/dev/null || true
+chmod 644 "$WEBROOT/index.html" "$WEBROOT/robots.txt"
 say "Страница развёрнута: ${WEBROOT}/index.html"
 
 # ──────────────────────────────────────────────
@@ -385,10 +413,22 @@ say "Страница развёрнута: ${WEBROOT}/index.html"
 # ──────────────────────────────────────────────
 say "Настраиваю Caddy…"
 mkdir -p /etc/caddy
-[[ -f "$CADDYFILE" ]] && cp "$CADDYFILE" "${CADDYFILE}.bak.$(date +%s)" && info "Бэкап старого Caddyfile создан"
+# собираем во временный файл: боевой Caddyfile заменяется только после validate
+NEWCADDY=$(mktemp /etc/caddy/Caddyfile.new.XXXXXX)
+trap 'rm -f "$NEWCADDY"' EXIT
 
-cat > "$CADDYFILE" <<'CADDYEOF'
-__GLOBAL__
+{
+  echo "{"
+  [[ -n "$EMAIL" ]] && echo "	email ${EMAIL}"
+  echo "	# только 443/TCP: HTTP/3 (UDP 443) выключен, порт остаётся свободным для Hysteria2"
+  echo "	servers {"
+  echo "		protocols h1 h2"
+  echo "	}"
+  echo "}"
+  echo
+} > "$NEWCADDY"
+
+cat >> "$NEWCADDY" <<'CADDYEOF'
 __DOMAIN__ {
 
 	# ── XHTTP инбаунд: замаскирован под эндпоинт стриминга сессии ──
@@ -445,28 +485,24 @@ __DOMAIN__ {
 }
 CADDYEOF
 
-if [[ -n "$EMAIL" ]]; then
-  GLOBAL="{
-	email ${EMAIL}
-}
-"
-else
-  GLOBAL=""
-fi
-
-python3 - "$CADDYFILE" "$GLOBAL" "$DOMAIN" "$XPATH" "$XRAY_PORT" "$WEBROOT" <<'PYEOF'
-import sys
-f, glob, dom, xpath, port, webroot = sys.argv[1:7]
-s = open(f).read()
-s = s.replace('__GLOBAL__\n', glob)
-s = s.replace('__DOMAIN__', dom).replace('__XPATH__', xpath)
-s = s.replace('__XRAYPORT__', port).replace('__WEBROOT__', webroot)
-open(f, 'w').write(s)
-PYEOF
+sed -i \
+  -e "s|__DOMAIN__|${DOMAIN}|g" \
+  -e "s|__XPATH__|${XPATH}|g" \
+  -e "s|__XRAYPORT__|${XRAY_PORT}|g" \
+  -e "s|__WEBROOT__|${WEBROOT}|g" \
+  "$NEWCADDY"
 
 say "Проверяю Caddyfile…"
-caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 \
-  || { caddy validate --config "$CADDYFILE" --adapter caddyfile || true; die "Caddyfile невалиден"; }
+caddy validate --config "$NEWCADDY" --adapter caddyfile >/dev/null 2>&1 \
+  || { caddy validate --config "$NEWCADDY" --adapter caddyfile || true; die "Caddyfile невалиден — действующий конфиг не тронут"; }
+
+if [[ -f "$CADDYFILE" ]]; then
+  cp "$CADDYFILE" "${CADDYFILE}.bak.$(date +%s)"
+  info "Бэкап старого Caddyfile создан"
+fi
+chmod 644 "$NEWCADDY"
+mv "$NEWCADDY" "$CADDYFILE"
+trap - EXIT
 
 systemctl enable caddy >/dev/null 2>&1 || true
 systemctl restart caddy
@@ -540,9 +576,8 @@ JSONEOF
 # ──────────────────────────────────────────────
 say "Проверяю доступность…"
 OK=0
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  CODE=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}/v1/health" 2>/dev/null || echo 000)
-  [[ "$CODE" == "200" ]] && { OK=1; break; }
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ "$(http_code "https://${DOMAIN}/v1/health")" == "200" ]] && { OK=1; break; }
   sleep 3
 done
 
@@ -555,14 +590,17 @@ else
   warn "Логи:      journalctl -u caddy --no-pager -n 40"
 fi
 
-# путь XHTTP не должен отдавать 404 (это значило бы, что он ушёл в заглушку)
-PCODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}${XPATH}/" 2>/dev/null || echo 000)
-if [[ "$PCODE" == "404" ]]; then
-  warn "Путь ${XPATH}/ отдаёт 404 — Caddy не проксирует его в Xray."
-elif [[ "$PCODE" == "502" || "$PCODE" == "000" ]]; then
-  info "Путь проксируется в Xray (${PCODE}). Инбаунд Xray ещё не поднят — это нормально до шага 1 ниже."
+# путь XHTTP не должен попадать в API-заглушку. Смотрим на тело ответа, а не на код:
+# 404 умеет отдавать и сам Xray.
+if is_stub "https://${DOMAIN}${XPATH}/"; then
+  warn "Путь ${XPATH}/ отдаёт ответ заглушки — Caddy не проксирует его в Xray."
 else
-  say "Путь ${XPATH}/ проксируется (код ${PCODE})"
+  PCODE=$(http_code "https://${DOMAIN}${XPATH}/" 6)
+  if [[ "$PCODE" == "502" || "$PCODE" == "000" ]]; then
+    info "Путь проксируется в Xray (${PCODE}). Инбаунд Xray ещё не поднят — это нормально, пока нода не установлена."
+  else
+    say "Путь ${XPATH}/ проксируется (код ${PCODE})"
+  fi
 fi
 
 # ──────────────────────────────────────────────
@@ -592,10 +630,19 @@ $(echo -e "${B}")  ХОСТ В ПАНЕЛИ REMNAWAVE $(echo -e "${N}")
 
 $(echo -e "${B}")  ДАЛЬШЕ $(echo -e "${N}")
 
-    1. Откройте ${OUTCONF} и вставьте его в Xray-конфиг ноды
-       (или добавьте inbound в существующий конфиг).
-    2. Перезапустите ноду.
-    3. Создайте хост в панели по параметрам выше.
+    Чистая нода (Remnawave Node ещё не установлен):
+    1. Панель → Config Profiles → Create Config Profile →
+       вставьте профиль, напечатанный ниже (он же в ${OUTCONF}).
+    2. Панель → Nodes → Management → "+": заполните карточку,
+       скопируйте docker-compose.yml и запустите его на этом сервере
+       (network_mode: host обязателен).
+    3. В карточке ноды: Next → выберите созданный профиль,
+       включите инбаунд VLESS_XHTTP_MEDIA → Create.
+    4. Включите инбаунд в Internal Squad и создайте хост по параметрам выше.
+
+    Нода уже работает с другим профилем:
+       добавьте в него только блок inbound VLESS_XHTTP_MEDIA.
+       Не заменяйте профиль целиком — пропадут остальные инбаунды.
 
 $(echo -e "${B}")  ПРОВЕРКА $(echo -e "${N}")
 
@@ -611,3 +658,8 @@ $(echo -e "${Y}")  ВАЖНО $(echo -e "${N}")
 ────────────────────────────────────────────────────────────────
 
 EOF
+
+echo -e "${B}  CONFIG PROFILE ДЛЯ ПАНЕЛИ (скопируйте целиком)${N}"
+echo
+cat "$OUTCONF"
+echo
