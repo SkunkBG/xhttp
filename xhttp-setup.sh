@@ -554,7 +554,7 @@ cat > "$OUTCONF" <<JSONEOF
     }
   ],
   "outbounds": [
-    { "tag": "DIRECT", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } },
+    { "tag": "DIRECT", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } },
     { "tag": "BLOCK", "protocol": "blackhole", "settings": {} }
   ],
   "routing": {
