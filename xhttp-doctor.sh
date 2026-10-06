@@ -13,10 +13,36 @@ ok(){ echo -e "  ${G}[OK]${N}   $*"; }
 bad(){ echo -e "  ${R}[FAIL]${N} $*"; }
 warn(){ echo -e "  ${Y}[??]${N}   $*"; }
 hdr(){ echo -e "\n${B}══ $* ═══════════════════════════${N}"; }
+# curl сам печатает 000 при сбое соединения — дописывать код через `|| echo` нельзя
+http_code() {
+  local c
+  c=$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${2:-8}" "$1" 2>/dev/null) || true
+  echo "${c:-000}"
+}
+# ответ пришёл от API-заглушки Caddy, а не от Xray
+is_stub() {
+  local b
+  b=$(curl -sS --max-time "${2:-6}" "$1" 2>/dev/null | tr -d '\0' | head -c 2000) || true
+  [[ "$b" == *resource_not_found* ]]
+}
 
 [[ $EUID -eq 0 ]] || { echo "Запустите от root"; exit 1; }
 CT="${CT:-remnanode}"; SOCKS=10809
 PROBLEMS=()
+
+# остановка тестового клиента; собственный шелл пропускаем: его cmdline тоже содержит имя конфига
+KILLER='for p in /proc/[0-9]*; do [ "${p#/proc/}" = "$$" ] && continue; [ -r "$p/cmdline" ] || continue; if tr "\0" " " < "$p/cmdline" 2>/dev/null | grep -q xd.json; then kill "${p#/proc/}" 2>/dev/null; fi; done'
+SUBTMP=""; CLIENT_STARTED=0
+# уборка срабатывает и при Ctrl-C
+cleanup() {
+  [[ -n "$SUBTMP" ]] && rm -f "$SUBTMP"
+  if [[ $CLIENT_STARTED -eq 1 ]]; then
+    docker exec "$CT" sh -c "$KILLER; rm -f /tmp/xd.json /tmp/xd.log" 2>/dev/null || true
+  fi
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 echo -e "\n${B}╔════════════════════════════════════════╗"
 echo -e "║   XHTTP Doctor — полная диагностика    ║"
@@ -28,6 +54,8 @@ DOMAIN="${DOMAIN:-}"
 
 XPATH=$(grep -oP 'path /v1/stream/[A-Za-z0-9_-]+' /etc/caddy/Caddyfile 2>/dev/null | head -1 | awk '{print $2}')
 [[ -z "$XPATH" ]] && XPATH=$(grep -oP '(?<=handle )/v1/stream/[A-Za-z0-9_-]+' /etc/caddy/Caddyfile 2>/dev/null | head -1)
+XPORT=$(grep -oP '(?<=reverse_proxy 127\.0\.0\.1:)\d+' /etc/caddy/Caddyfile 2>/dev/null | head -n1)
+XPORT="${XPORT:-8001}"
 
 echo -e "\n${Y}Ссылка на подписку любого юзера (панель → юзер → кнопка копирования${N}"
 echo -e "${Y}подписки). Это ГЛАВНОЕ — покажет, что реально получают клиенты.${N}"
@@ -36,13 +64,15 @@ read -rp $'Ссылка на подписку: ' SUBURL < /dev/tty
 
 # ─────────────────────────────────────────────────────
 hdr "1. Инфраструктура"
-systemctl is-active --quiet caddy && ok "Caddy запущен" || { bad "Caddy не запущен"; PROBLEMS+=("Caddy не работает"); }
+if systemctl is-active --quiet caddy; then ok "Caddy запущен"; else bad "Caddy не запущен"; PROBLEMS+=("Caddy не работает"); fi
 
-if ss -tlnH "sport = :8001" 2>/dev/null | grep -q .; then
-  ok "Xray слушает 127.0.0.1:8001"
-else
-  bad "порт 8001 не слушается — инбаунд не поднят"; PROBLEMS+=("Xray-инбаунд не работает")
-fi
+LADDR=$(ss -tlnH "sport = :${XPORT}" 2>/dev/null | awk '{print $4}' | head -n1)
+case "$LADDR" in
+  "") bad "порт ${XPORT} не слушается — инбаунд не поднят"; PROBLEMS+=("Xray-инбаунд не работает") ;;
+  127.0.0.1:*|"[::1]":*) ok "Xray слушает ${LADDR}" ;;
+  *) bad "порт ${XPORT} слушается на ${LADDR} — инбаунд без TLS доступен снаружи"
+     PROBLEMS+=("инбаунд слушает не на 127.0.0.1") ;;
+esac
 
 if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qx "$CT"; then
   M=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CT" 2>/dev/null)
@@ -51,9 +81,16 @@ if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qx "$
 fi
 
 # ─────────────────────────────────────────────────────
-hdr "2. Автопочинка матчера Caddy"
-if grep -q "handle ${XPATH}/\* {" /etc/caddy/Caddyfile 2>/dev/null; then
-  warn "старый матчер — путь без слэша уходит в заглушку. Чиню…"
+hdr "2. Матчер Caddy"
+FIX=""; OLDMATCH=0
+if [[ -n "$XPATH" ]] && grep -q "handle ${XPATH}/\* {" /etc/caddy/Caddyfile 2>/dev/null; then
+  OLDMATCH=1
+  warn "старый матчер — путь без слэша уходит в заглушку."
+  # диагностика не меняет боевой конфиг без согласия
+  read -rp "  Исправить Caddyfile и перезагрузить Caddy? [y/N]: " FIX < /dev/tty || FIX=""
+  [[ "${FIX,,}" == y* ]] || PROBLEMS+=("старый матчер Caddy не исправлен")
+fi
+if [[ "${FIX,,}" == y* ]]; then
   cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
   python3 - "$XPATH" <<'PYEOF'
 import sys, re
@@ -71,20 +108,23 @@ PYEOF
     bad "после правки Caddyfile невалиден — откатываю"
     cp "$(ls -t /etc/caddy/Caddyfile.bak.* | head -1)" /etc/caddy/Caddyfile
   fi
-else
-  ok "матчер уже корректный"
+elif [[ $OLDMATCH -eq 0 ]]; then
+  ok "матчер корректный"
 fi
 
 # ─────────────────────────────────────────────────────
 hdr "3. Сайт-заглушка и проксирование"
 for p in "/v1/health" "/"; do
-  C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}${p}" 2>/dev/null || echo 000)
-  [[ "$C" == "200" ]] && ok "${p} → 200" || { bad "${p} → ${C}"; PROBLEMS+=("сайт недоступен"); }
+  C=$(http_code "https://${DOMAIN}${p}")
+  if [[ "$C" == "200" ]]; then ok "${p} → 200"; else bad "${p} → ${C}"; PROBLEMS+=("сайт недоступен"); fi
 done
+# заглушку узнаём по телу ответа: 404 умеет отдавать и сам Xray
 for u in "${XPATH}" "${XPATH}/"; do
-  C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${DOMAIN}${u}" 2>/dev/null || echo 000)
-  [[ "$C" == "404" ]] && { bad "${u} → 404 (в заглушку, не в Xray)"; PROBLEMS+=("путь не проксируется"); } \
-                      || ok "${u} → ${C} (проксируется в Xray)"
+  if is_stub "https://${DOMAIN}${u}"; then
+    bad "${u} → ответ API-заглушки (не в Xray)"; PROBLEMS+=("путь не проксируется")
+  else
+    ok "${u} → $(http_code "https://${DOMAIN}${u}" 6) (проксируется в Xray)"
+  fi
 done
 
 # ─────────────────────────────────────────────────────
@@ -97,10 +137,13 @@ else
   if [[ -z "$RAW" ]]; then
     bad "подписка не скачалась"; PROBLEMS+=("подписка недоступна")
   else
-    UUID=$(python3 - "$RAW" "$DOMAIN" "$XPATH" <<'PYEOF'
+    # через файл, а не аргумент: большая подписка не влезает в лимит argv
+    SUBTMP=$(mktemp)
+    printf '%s' "$RAW" > "$SUBTMP"
+    UUID=$(python3 - "$SUBTMP" "$DOMAIN" "$XPATH" <<'PYEOF'
 import sys, base64, re, urllib.parse as up
 
-raw, domain, xpath = sys.argv[1], sys.argv[2], sys.argv[3]
+raw, domain, xpath = open(sys.argv[1]).read().strip(), sys.argv[2], sys.argv[3]
 
 # подписка может быть base64
 text = raw
@@ -185,6 +228,7 @@ for L in links:
 print(f"\nUUID={picked}")
 PYEOF
 )
+    rm -f "$SUBTMP"; SUBTMP=""
     echo "$UUID" | grep -v '^UUID=' || true
     UUID=$(echo "$UUID" | grep '^UUID=' | cut -d= -f2)
     [[ -n "$UUID" ]] && ok "UUID для теста извлечён: ${UUID:0:8}…"
@@ -200,7 +244,10 @@ fi
 if [[ -z "$UUID" ]]; then
   warn "пропущен"
 else
-cat > /tmp/xd.json <<EOF
+CLIENT_STARTED=1
+docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
+# конфиг с UUID пишется сразу в контейнер, на хосте копии не остаётся
+docker exec -i "$CT" sh -c 'umask 077; cat > /tmp/xd.json' <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{ "tag":"s","listen":"127.0.0.1","port":${SOCKS},"protocol":"socks",
@@ -217,11 +264,8 @@ cat > /tmp/xd.json <<EOF
   }]
 }
 EOF
-KILLER='for p in /proc/[0-9]*; do [ -r "$p/cmdline" ] || continue; if tr "\0" " " < "$p/cmdline" 2>/dev/null | grep -q xd.json; then kill "${p#/proc/}" 2>/dev/null; fi; done'
-docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
-docker exec -i "$CT" sh -c 'cat > /tmp/xd.json' < /tmp/xd.json
 docker exec -d "$CT" sh -c 'exec xray run -c /tmp/xd.json > /tmp/xd.log 2>&1'
-UP=0; for i in $(seq 1 15); do ss -tlnH "sport = :${SOCKS}" 2>/dev/null | grep -q . && { UP=1; break; }; sleep 1; done
+UP=0; for _ in $(seq 1 15); do ss -tlnH "sport = :${SOCKS}" 2>/dev/null | grep -q . && { UP=1; break; }; sleep 1; done
 
 if [[ $UP -eq 1 ]]; then
   IP=$(curl -sS --max-time 25 --socks5-hostname "127.0.0.1:${SOCKS}" https://api.ipify.org 2>/dev/null)
@@ -235,8 +279,7 @@ else
   bad "клиент не стартовал"
   docker exec "$CT" sh -c 'tail -20 /tmp/xd.log' 2>/dev/null | sed 's/^/       /'
 fi
-docker exec "$CT" sh -c "$KILLER; rm -f /tmp/xd.json /tmp/xd.log" 2>/dev/null || true
-rm -f /tmp/xd.json
+cleanup; CLIENT_STARTED=0
 fi
 
 # ─────────────────────────────────────────────────────

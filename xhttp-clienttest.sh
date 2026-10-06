@@ -61,8 +61,27 @@ fi
 
 echo -e "\n  Домен : ${DOMAIN}\n  Path  : ${XPATH}\n  UUID  : ${UUID:0:8}…\n"
 
-# ── конфиг клиента ──
-cat > /tmp/xhttp-client.json <<EOF
+# остановка прошлых экземпляров без pgrep (его нет в контейнере ноды).
+# Собственный шелл пропускаем: его cmdline тоже содержит имя конфига.
+KILLER='for p in /proc/[0-9]*; do
+  [ "${p#/proc/}" = "$$" ] && continue
+  [ -r "$p/cmdline" ] || continue
+  if tr "\0" " " < "$p/cmdline" 2>/dev/null | grep -q xhttp-client.json; then
+    kill "${p#/proc/}" 2>/dev/null
+  fi
+done'
+
+# уборка срабатывает и при Ctrl-C: тестовый клиент не остаётся в контейнере ноды
+cleanup() {
+  docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
+  docker exec "$CT" sh -c 'rm -f /tmp/xhttp-client.json /tmp/xhttp-client.log' 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+hdr "1. Заливаю конфиг клиента в контейнер"
+# конфиг с UUID пишется сразу в контейнер, на хосте копии не остаётся
+if docker exec -i "$CT" sh -c 'umask 077; cat > /tmp/xhttp-client.json' <<EOF
 {
   "log": { "loglevel": "debug" },
   "inbounds": [
@@ -105,18 +124,7 @@ cat > /tmp/xhttp-client.json <<EOF
   ]
 }
 EOF
-
-hdr "1. Заливаю конфиг клиента в контейнер"
-docker exec -i "$CT" sh -c 'cat > /tmp/xhttp-client.json' < /tmp/xhttp-client.json \
-  && ok "конфиг записан" || { bad "не удалось записать конфиг"; exit 1; }
-
-# убийство прошлых экземпляров без pgrep (его нет в контейнере ноды)
-KILLER='for p in /proc/[0-9]*; do
-  [ -r "$p/cmdline" ] || continue
-  if tr "\0" " " < "$p/cmdline" 2>/dev/null | grep -q xhttp-client.json; then
-    kill "${p#/proc/}" 2>/dev/null
-  fi
-done'
+then ok "конфиг записан"; else bad "не удалось записать конфиг"; exit 1; fi
 
 hdr "2. Запускаю тестовый клиент Xray"
 docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
@@ -128,7 +136,7 @@ docker exec -d "$CT" sh -c 'exec xray run -c /tmp/xhttp-client.json > /tmp/xhttp
 
 # ждём появления слушающего сокета (до 15 сек)
 UP=0
-for i in $(seq 1 15); do
+for _ in $(seq 1 15); do
   if ss -tlnH "sport = :${SOCKS}" 2>/dev/null | grep -q .; then UP=1; break; fi
   sleep 1
 done
@@ -138,7 +146,6 @@ if [[ $UP -eq 1 ]]; then
 else
   bad "порт ${SOCKS} не слушается. Лог клиента:"
   docker exec "$CT" sh -c 'tail -25 /tmp/xhttp-client.log' 2>/dev/null | sed 's/^/       /'
-  docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
   exit 1
 fi
 
@@ -187,8 +194,7 @@ else
 fi
 
 hdr "4. Убираю за собой"
-docker exec "$CT" sh -c "$KILLER" 2>/dev/null || true
-docker exec "$CT" sh -c 'rm -f /tmp/xhttp-client.json /tmp/xhttp-client.log' 2>/dev/null || true
-rm -f /tmp/xhttp-client.json
+cleanup
+trap - EXIT
 ok "тестовый клиент остановлен, временные файлы удалены"
 echo
