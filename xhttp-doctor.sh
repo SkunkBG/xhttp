@@ -231,14 +231,25 @@ PYEOF
     rm -f "$SUBTMP"; SUBTMP=""
     echo "$UUID" | grep -v '^UUID=' || true
     UUID=$(echo "$UUID" | grep '^UUID=' | cut -d= -f2)
-    [[ -n "$UUID" ]] && ok "UUID для теста извлечён: ${UUID:0:8}…"
+    if [[ -n "$UUID" ]]; then
+      ok "UUID для теста извлечён: ${UUID:0:8}…"
+    else
+      bad "в подписке нет ни одного xhttp-хоста — клиенты его не получают"
+      echo -e "       ${Y}Проверьте: хост включён (видимость), инбаунд добавлен в Internal Squad этого юзера.${N}"
+      PROBLEMS+=("xhttp-хост отсутствует в подписке")
+    fi
   fi
 fi
 
 # ─────────────────────────────────────────────────────
 hdr "5. Тест туннеля настоящим клиентом"
 if [[ -z "$UUID" ]]; then
+  echo -e "  ${Y}Нужен VLESS-UUID (формат 8-4-4-4-12), а НЕ короткий ID из ссылки подписки.${N}"
   read -rp "  UUID пользователя (или Enter — пропустить): " UUID < /dev/tty
+  if [[ -n "$UUID" && ! "$UUID" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    bad "это не VLESS-UUID — тест туннеля пропущен"
+    UUID=""
+  fi
 fi
 
 if [[ -z "$UUID" ]]; then
